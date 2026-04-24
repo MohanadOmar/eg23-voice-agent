@@ -1,7 +1,6 @@
 """
 EG23 Voice Agent — Groq Edition
 Stack: Twilio + Deepgram (STT) + Groq Llama 3.1 + OpenAI TTS
-Fast LLM (~200ms) + reliable TTS + cheap
 """
 
 import os
@@ -73,21 +72,14 @@ SERVER_URL          = os.getenv("SERVER_URL", "").rstrip("/")
 CALL_TO_NUMBER      = os.getenv("CALL_TO_NUMBER")
 N8N_WEBHOOK_URL     = os.getenv("N8N_WEBHOOK_URL", "")
 
-# OpenAI for TTS only
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
-# Groq via OpenAI-compatible client
-groq_client = AsyncOpenAI(
-    api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1"
-)
-
+groq_client   = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 app = FastAPI()
 
 
-# ─── DODO SYSTEM PROMPT (tuned for voice) ───
+# ─── DODO SYSTEM PROMPT ───
 DODO_PROMPT = """You are Dodo — EG23's AI sales assistant calling a lead who requested a free trial on eg23.net.
 
 EG23 builds AI agents, workflows, and automations for small businesses.
@@ -108,22 +100,17 @@ STYLE — CRITICAL FOR VOICE
 RULES
 - If they're busy: "Totally get it — want me to call back later?"
 - If not interested: "No worries, thanks for picking up. Have a good one."
-- Pricing question: "Depends on your setup — most start under a hundred for setup. The team covers it on the call."
+- Pricing: "Depends on your setup — most start under a hundred for setup. The team covers it on the call."
 - Never invent features or guarantees
-
-OPENING (already spoken — continue from here naturally):
-"Hey, this is Dodo from EG23. You requested a free trial on our site. Got two minutes?"
 
 Keep it flowing naturally. Be brief. Sound human."""
 
 
-# ─── HEALTH CHECK ───
 @app.get("/")
 async def health():
-    return {"status": "EG23 Voice Agent running", "version": "groq-edition"}
+    return {"status": "EG23 Voice Agent running", "version": "groq-v2"}
 
 
-# ─── TWILIO ANSWER WEBHOOK ───
 @app.post("/answer")
 async def answer(request: Request):
     ws_url = SERVER_URL.replace("https://", "wss://").replace("http://", "ws://")
@@ -136,7 +123,6 @@ async def answer(request: Request):
     return Response(content=twiml, media_type="application/xml")
 
 
-# ─── WEBSOCKET CONVERSATION LOOP ───
 @app.websocket("/stream")
 async def stream(ws: WebSocket):
     await ws.accept()
@@ -149,19 +135,22 @@ async def stream(ws: WebSocket):
     is_speaking        = False
     has_spoken_opening = False
 
-    # Deepgram STT — tuned for speed
     dg_url = (
         "wss://api.deepgram.com/v1/listen"
-        "?model=nova-2&encoding=mulaw&sample_rate=8000"
-        "&channels=1&punctuate=true&interim_results=true"
-        "&endpointing=300&utterance_end_ms=900"
+        "?encoding=mulaw"
+        "&sample_rate=8000"
+        "&channels=1"
+        "&model=nova-2"
+        "&interim_results=true"
+        "&utterance_end_ms=1000"
+        "&vad_events=true"
+        "&endpointing=300"
     )
     dg_headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
 
     try:
-        try:
-            async with websockets.connect(dg_url, additional_headers=dg_headers) as dg_ws:
-                print("[DEEPGRAM STT] Connected")
+        async with websockets.connect(dg_url, additional_headers=dg_headers) as dg_ws:
+            print("[DEEPGRAM STT] Connected")
 
             async def twilio_to_deepgram():
                 nonlocal stream_sid, has_spoken_opening
@@ -197,7 +186,7 @@ async def stream(ws: WebSocket):
                 except WebSocketDisconnect:
                     print("[WS] Twilio disconnected")
                 except Exception as e:
-                    print(f"[TWILIO→DG] Error: {e}")
+                    print(f"[TWILIO->DG] Error: {e}")
 
             async def deepgram_to_response():
                 nonlocal is_speaking, call_outcome
@@ -215,9 +204,8 @@ async def stream(ws: WebSocket):
                                 print(f"[USER] {user_text}")
                                 transcript_log.append(f"Lead: {user_text}")
 
-                                # Detect outcome signals
                                 lower = user_text.lower()
-                                if any(w in lower for w in ["not interested", "no thanks", "don't want", "stop calling"]):
+                                if any(w in lower for w in ["not interested", "no thanks", "stop calling"]):
                                     call_outcome = "not_interested"
                                 elif any(w in lower for w in ["yes", "sure", "interested", "sounds good", "book"]):
                                     call_outcome = "interested"
@@ -240,14 +228,13 @@ async def stream(ws: WebSocket):
                             buffer += " " + transcript
 
                 except Exception as e:
-                    print(f"[DG→RESPONSE] Error: {e}")
+                    print(f"[DG->RESPONSE] Error: {e}")
 
             await asyncio.gather(twilio_to_deepgram(), deepgram_to_response())
 
     except Exception as e:
         print(f"[WS] Error: {e}")
 
-    # ─── CALL ENDED ───
     print(f"[OUTCOME] {call_outcome}")
     print(f"[TRANSCRIPT] {len(transcript_log)} exchanges")
 
@@ -264,15 +251,13 @@ async def stream(ws: WebSocket):
             print(f"[N8N] Failed: {e}")
 
 
-# ─── STREAM GROQ + SPEAK SENTENCE BY SENTENCE ───
 async def stream_groq_and_speak(conversation, stream_sid, ws, transcript_log):
-    """Stream Groq response; speak each sentence as it completes."""
     full_response = ""
     sentence_buf  = ""
 
     try:
         stream = await groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",  # fastest Groq model, great for voice
+            model="llama-3.1-8b-instant",
             messages=conversation,
             max_tokens=100,
             temperature=0.7,
@@ -284,10 +269,9 @@ async def stream_groq_and_speak(conversation, stream_sid, ws, transcript_log):
             if not delta:
                 continue
 
-            sentence_buf   += delta
-            full_response  += delta
+            sentence_buf  += delta
+            full_response += delta
 
-            # When we have a complete sentence, speak it immediately
             if any(p in sentence_buf for p in ['.', '!', '?']):
                 last_punct = max(
                     sentence_buf.rfind('.'),
@@ -300,7 +284,6 @@ async def stream_groq_and_speak(conversation, stream_sid, ws, transcript_log):
                     if to_speak:
                         await speak_openai(to_speak, stream_sid, ws)
 
-        # Speak any remaining text
         if sentence_buf.strip():
             await speak_openai(sentence_buf.strip(), stream_sid, ws)
 
@@ -310,14 +293,12 @@ async def stream_groq_and_speak(conversation, stream_sid, ws, transcript_log):
         transcript_log.append(f"Dodo: {full_response}")
 
     except Exception as e:
-        print(f"[GROQ STREAM] Error: {e}")
-        fallback = "Sorry, I missed that — could you repeat?"
+        print(f"[GROQ] Error: {e}")
+        fallback = "Sorry, I missed that. Could you repeat?"
         await speak_openai(fallback, stream_sid, ws)
 
 
-# ─── OPENAI TTS → TWILIO ───
 async def speak_openai(text: str, stream_sid: str, ws: WebSocket):
-    """Generate speech with OpenAI TTS and stream to Twilio."""
     if not stream_sid or not text:
         return
 
@@ -329,14 +310,10 @@ async def speak_openai(text: str, stream_sid: str, ws: WebSocket):
             response_format="pcm"
         )
 
-        pcm_24k = response.content
-
-        # Resample 24000 → 8000
+        pcm_24k   = response.content
         pcm_8k, _ = audioop.ratecv(pcm_24k, 2, 1, 24000, 8000, None)
-        # Convert to mulaw
-        mulaw = audioop.lin2ulaw(pcm_8k, 2)
+        mulaw     = audioop.lin2ulaw(pcm_8k, 2)
 
-        # Stream to Twilio in 20ms chunks
         chunk_size = 160
         for i in range(0, len(mulaw), chunk_size):
             chunk   = mulaw[i:i + chunk_size]
@@ -352,7 +329,6 @@ async def speak_openai(text: str, stream_sid: str, ws: WebSocket):
         print(f"[TTS] Error: {e}")
 
 
-# ─── INITIATE OUTBOUND CALL ───
 @app.post("/initiate-call")
 async def initiate_call(request: Request):
     body      = await request.json()
@@ -371,10 +347,9 @@ async def initiate_call(request: Request):
     return {"call_sid": call.sid, "status": call.status}
 
 
-# ─── START SERVER ───
 if __name__ == "__main__":
     print("=" * 50)
-    print("EG23 Voice Agent — Groq Edition")
+    print("EG23 Voice Agent — Groq v2")
     print(f"SERVER_URL : {SERVER_URL}")
     print("=" * 50)
 
