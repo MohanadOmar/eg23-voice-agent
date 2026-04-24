@@ -8,13 +8,16 @@ import os
 import asyncio
 import base64
 import json
-import audioop
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from twilio.rest import Client
 from openai import OpenAI
 import uvicorn
 from dotenv import load_dotenv
+try:
+    import audioop
+except ImportError:
+    import audioop_lts as audioop
 
 load_dotenv()
 
