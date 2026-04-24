@@ -1,71 +1,79 @@
 """
 EG23 Voice Agent — Simple Test
 Just run this script, it calls your phone, and Dodo speaks.
-Requirements: pip install twilio openai fastapi uvicorn python-dotenv
 """
 
 import os
 import asyncio
 import base64
 import json
+import struct
+import array
+import threading
+import time
+
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from twilio.rest import Client
 from openai import OpenAI
 import uvicorn
 from dotenv import load_dotenv
+
+load_dotenv()
+
+# ─── audioop compatibility for Python 3.13 ───
 try:
     import audioop
 except ImportError:
-    import struct
-    # audioop replacement for Python 3.13+
     class audioop:
         @staticmethod
-        def ratecv(data, width, nchannels, inrate, outrate, state, weightA=1, weightB=0):
-            # Simple linear resampling
-            ratio = outrate / inrate
-            n_out = int(len(data) / width / nchannels * ratio)
-            import array
-            out = array.array('h', [0] * n_out * nchannels)
-            for i in range(n_out):
-                src = int(i / ratio)
+        def ratecv(data, width, nchannels, inrate, outrate, state,
+                   weightA=1, weightB=0):
+            """Resample audio data."""
+            n_samples_in  = len(data) // (width * nchannels)
+            n_samples_out = int(n_samples_in * outrate / inrate)
+            result = bytearray()
+            for i in range(n_samples_out):
+                src = int(i * inrate / outrate)
+                src = min(src, n_samples_in - 1)
                 for c in range(nchannels):
-                    idx_src = (src * nchannels + c) * width // 2
-                    idx_dst = (i * nchannels + c)
-                    if idx_src < len(data) // 2:
-                        out[idx_dst] = struct.unpack_from('<h', data, idx_src * 2)[0]
-            return out.tobytes(), None
+                    offset = (src * nchannels + c) * width
+                    chunk  = data[offset:offset + width]
+                    result.extend(chunk)
+            return bytes(result), None
 
         @staticmethod
         def lin2ulaw(data, width):
-            import array
-            samples = array.array('h')
-            samples.frombytes(data)
-            result = []
-            for s in samples:
-                s = max(-32768, min(32767, s))
+            """Convert linear PCM to u-law."""
+            fmt     = '<h' if width == 2 else '<b'
+            n       = len(data) // width
+            result  = []
+            for i in range(n):
+                s = struct.unpack_from(fmt, data, i * width)[0]
+                if width == 1:
+                    s = s * 256
+                s    = max(-32768, min(32767, s))
                 sign = 0x80 if s < 0 else 0
-                s = abs(s)
-                s += 132
-                exp = 7
+                s    = abs(s)
+                s   += 132
+                exp  = 7
                 for e in range(7, 0, -1):
                     if s >= (1 << (e + 3)):
                         exp = e
                         break
                 mantissa = (s >> (exp + 3)) & 0x0F
-                ulaw = ~(sign | (exp << 4) | mantissa) & 0xFF
+                ulaw     = (~(sign | (exp << 4) | mantissa)) & 0xFF
                 result.append(ulaw)
             return bytes(result)
 
-load_dotenv()
 
-# ─── CONFIG — fill these in or add to .env ───
-TWILIO_ACCOUNT_SID  = os.getenv("TWILIO_ACCOUNT_SID",  "ACxxxxxxxx")
-TWILIO_AUTH_TOKEN   = os.getenv("TWILIO_AUTH_TOKEN",   "xxxxxxxx")
-TWILIO_FROM_NUMBER  = os.getenv("TWILIO_PHONE_NUMBER", "+1xxxxxxxxxx")
-OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY",      "sk-xxxxxxxx")
-SERVER_URL          = os.getenv("SERVER_URL",           "https://xxxx.ngrok.io")
-CALL_TO_NUMBER      = os.getenv("CALL_TO_NUMBER",       "+1xxxxxxxxxx")  # YOUR phone number
+# ─── CONFIG ───
+TWILIO_ACCOUNT_SID  = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN   = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_FROM_NUMBER  = os.getenv("TWILIO_PHONE_NUMBER")
+OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY")
+SERVER_URL          = os.getenv("SERVER_URL", "").rstrip("/")
+CALL_TO_NUMBER      = os.getenv("CALL_TO_NUMBER")
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -73,34 +81,33 @@ twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 app = FastAPI()
 
 
-# ─────────────────────────────────────────────
-# STEP 1 — Twilio calls this to get instructions
-# ─────────────────────────────────────────────
+# ─── HEALTH CHECK ───
+@app.get("/")
+async def health():
+    return {"status": "EG23 Voice Agent running"}
+
+
+# ─── TWILIO ANSWER WEBHOOK ───
 @app.post("/answer")
 async def answer(request: Request):
-    """
-    When the call connects, Twilio hits this endpoint.
-    We tell Twilio to open a media stream to our WebSocket.
-    """
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    ws_url = SERVER_URL.replace("https://", "wss://").replace("http://", "ws://")
+    twiml  = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Joanna">Please wait while we connect you to Dodo.</Say>
+  <Say voice="Polly.Joanna">Please wait while we connect you.</Say>
   <Connect>
-    <Stream url="wss://{SERVER_URL.replace('https://','').replace('http://','')}/stream"/>
+    <Stream url="{ws_url}/stream"/>
   </Connect>
 </Response>"""
     return Response(content=twiml, media_type="application/xml")
 
 
-# ─────────────────────────────────────────────
-# STEP 2 — WebSocket handles live audio
-# ─────────────────────────────────────────────
+# ─── WEBSOCKET AUDIO HANDLER ───
 @app.websocket("/stream")
 async def stream(ws: WebSocket):
     await ws.accept()
     print("[WS] Twilio connected")
 
-    stream_sid = None
+    stream_sid         = None
     has_spoken_opening = False
 
     try:
@@ -108,27 +115,22 @@ async def stream(ws: WebSocket):
             msg   = json.loads(raw)
             event = msg.get("event")
 
-            # ── Stream started ──
             if event == "start":
                 stream_sid = msg["start"]["streamSid"]
                 print(f"[STREAM] Started: {stream_sid}")
 
-                # Speak opening message immediately
                 if not has_spoken_opening:
                     has_spoken_opening = True
                     opening = (
                         "Hey — this is Dodo calling from EG23. "
-                        "I'm an AI assistant. Just calling to confirm you'd like to try "
+                        "I'm an AI assistant. I'm calling to confirm you'd like to try "
                         "our free AI automation setup. Can you hear me okay?"
                     )
                     print(f"[DODO] {opening}")
                     await speak(opening, stream_sid, ws)
 
-            # ── Incoming audio from caller ──
             elif event == "media":
-                # For this simple test we just echo a response after receiving audio
-                # In the full version this goes to Deepgram for STT
-                pass
+                pass  # STT goes here in full version
 
             elif event == "stop":
                 print("[STREAM] Stopped")
@@ -140,29 +142,26 @@ async def stream(ws: WebSocket):
         print(f"[WS] Error: {e}")
 
 
-# ─────────────────────────────────────────────
-# STEP 3 — TTS using OpenAI → stream to Twilio
-# ─────────────────────────────────────────────
+# ─── TTS → TWILIO ───
 async def speak(text: str, stream_sid: str, ws: WebSocket):
-    """Convert text to speech and stream audio back to the caller via Twilio."""
-    print(f"[TTS] Generating: {text[:60]}...")
-
+    print(f"[TTS] Generating speech...")
     try:
-        # Generate speech with OpenAI
         response = openai_client.audio.speech.create(
             model="tts-1",
-            voice="nova",          # warm, friendly voice
+            voice="nova",
             input=text,
-            response_format="pcm"  # raw PCM 24kHz
+            response_format="pcm"
         )
 
         pcm_24k = response.content
 
-        # Convert PCM 24kHz stereo → mulaw 8kHz mono (Twilio format)
+        # Resample 24000 → 8000
         pcm_8k, _ = audioop.ratecv(pcm_24k, 2, 1, 24000, 8000, None)
-        mulaw      = audioop.lin2ulaw(pcm_8k, 2)
 
-        # Send audio in 20ms chunks
+        # Convert to mulaw
+        mulaw = audioop.lin2ulaw(pcm_8k, 2)
+
+        # Stream to Twilio in 20ms chunks
         chunk_size = 160
         for i in range(0, len(mulaw), chunk_size):
             chunk   = mulaw[i:i + chunk_size]
@@ -179,57 +178,35 @@ async def speak(text: str, stream_sid: str, ws: WebSocket):
         print(f"[TTS] Error: {e}")
 
 
-# ─────────────────────────────────────────────
-# STEP 4 — Initiate the outbound call
-# ─────────────────────────────────────────────
-def make_call():
-    print(f"[TWILIO] Calling {CALL_TO_NUMBER}...")
+# ─── INITIATE OUTBOUND CALL ───
+@app.post("/initiate-call")
+async def initiate_call(request: Request):
+    body          = await request.json()
+    to_number     = body.get("to", CALL_TO_NUMBER)
+    lead_name     = body.get("name", "there")
+    business_type = body.get("business_type", "")
+    goal          = body.get("goal", "")
+
+    print(f"[TWILIO] Calling {to_number}...")
 
     call = twilio_client.calls.create(
-        to=CALL_TO_NUMBER,
+        to=to_number,
         from_=TWILIO_FROM_NUMBER,
-        url=f"{SERVER_URL}/answer",   # Twilio fetches TwiML from here
+        url=f"{SERVER_URL}/answer",
         method="POST"
     )
 
-    print(f"[TWILIO] Call initiated → SID: {call.sid}")
-    print(f"[TWILIO] Status: {call.status}")
-    return call.sid
+    print(f"[TWILIO] Call SID: {call.sid} | Status: {call.status}")
+    return {"call_sid": call.sid, "status": call.status}
 
 
-# ─────────────────────────────────────────────
-# MAIN — Start server then make the call
-# ─────────────────────────────────────────────
+# ─── START SERVER ───
 if __name__ == "__main__":
-    import threading
-    import time
-
     print("=" * 50)
-    print("EG23 Voice Agent — Simple Test")
-    print("=" * 50)
-    print(f"Server URL : {SERVER_URL}")
+    print("EG23 Voice Agent — Test Mode")
+    print(f"SERVER_URL : {SERVER_URL}")
     print(f"Calling    : {CALL_TO_NUMBER}")
     print("=" * 50)
 
-    # Start the FastAPI server in a background thread
-    def run_server():
-        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
-
-    server_thread = threading.Thread(target=run_server, daemon=True)
-    server_thread.start()
-
-    # Wait for server to start
-    time.sleep(2)
-    print("[SERVER] Running on port 8000")
-
-    # Make the call
-    make_call()
-
-    print("\n[WAITING] Keep this running until the call ends...")
-    print("Press Ctrl+C to stop\n")
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n[STOPPED]")
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
