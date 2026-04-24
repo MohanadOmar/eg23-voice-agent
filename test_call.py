@@ -17,7 +17,45 @@ from dotenv import load_dotenv
 try:
     import audioop
 except ImportError:
-    import audioop_lts as audioop
+    import struct
+    # audioop replacement for Python 3.13+
+    class audioop:
+        @staticmethod
+        def ratecv(data, width, nchannels, inrate, outrate, state, weightA=1, weightB=0):
+            # Simple linear resampling
+            ratio = outrate / inrate
+            n_out = int(len(data) / width / nchannels * ratio)
+            import array
+            out = array.array('h', [0] * n_out * nchannels)
+            for i in range(n_out):
+                src = int(i / ratio)
+                for c in range(nchannels):
+                    idx_src = (src * nchannels + c) * width // 2
+                    idx_dst = (i * nchannels + c)
+                    if idx_src < len(data) // 2:
+                        out[idx_dst] = struct.unpack_from('<h', data, idx_src * 2)[0]
+            return out.tobytes(), None
+
+        @staticmethod
+        def lin2ulaw(data, width):
+            import array
+            samples = array.array('h')
+            samples.frombytes(data)
+            result = []
+            for s in samples:
+                s = max(-32768, min(32767, s))
+                sign = 0x80 if s < 0 else 0
+                s = abs(s)
+                s += 132
+                exp = 7
+                for e in range(7, 0, -1):
+                    if s >= (1 << (e + 3)):
+                        exp = e
+                        break
+                mantissa = (s >> (exp + 3)) & 0x0F
+                ulaw = ~(sign | (exp << 4) | mantissa) & 0xFF
+                result.append(ulaw)
+            return bytes(result)
 
 load_dotenv()
 
