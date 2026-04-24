@@ -3,4 +3,5 @@ openai
 fastapi
 uvicorn
 python-dotenv
-audioop-lts
+websockets
+httpx
