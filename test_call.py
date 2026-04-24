@@ -145,7 +145,7 @@ async def stream(ws: WebSocket):
         "wss://api.deepgram.com/v1/listen"
         "?model=nova-2&encoding=mulaw&sample_rate=8000"
         "&channels=1&punctuate=true&interim_results=true"
-        "&endpointing=500&utterance_end_ms=1200"
+        "&endpointing=300&utterance_end_ms=700"
     )
     dg_headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
 
