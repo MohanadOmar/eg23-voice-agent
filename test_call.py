@@ -1,7 +1,7 @@
 """
-EG23 Voice Agent — Full Conversation Version
-Stack: Twilio + Deepgram (STT) + GPT-4o mini + OpenAI TTS
-Dodo can now listen, think, and respond.
+EG23 Voice Agent — Optimized Version
+Stack: Twilio + Deepgram (STT + Aura TTS) + GPT-4o mini
+Low latency (~1s) + natural voice
 """
 
 import os
@@ -78,40 +78,40 @@ twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 app = FastAPI()
 
 
-# ─── DODO SYSTEM PROMPT ───
+# ─── DODO SYSTEM PROMPT (tuned for voice) ───
 DODO_PROMPT = """You are Dodo — EG23's AI sales assistant calling a lead who requested a free trial on eg23.net.
 
-EG23 is an AI agency that builds AI agents, intelligent workflows, and automations for small businesses. Slogan: "We test more than we develop."
+EG23 builds AI agents, workflows, and automations for small businesses.
 
 YOUR GOAL
-1. Confirm you're speaking to the right person
-2. Quickly understand their business and what they want to automate
-3. Answer short questions if asked
-4. Book a 15-minute setup call with the EG23 team
+1. Confirm the right person
+2. Find out what they want to automate
+3. Book a 15-minute call with the EG23 team
 
-TONE
-- Warm, direct, confident — like a real assistant, not a bot
-- Short sentences. Natural speech. Never sound scripted
-- Keep responses under 2-3 sentences unless answering a specific question
-- Never say "I'm just an AI" or "I'm a chatbot"
+STYLE — CRITICAL FOR VOICE
+- Speak like a real person on the phone
+- Very short sentences. One idea at a time.
+- Use natural phrases: "okay", "got it", "right", "makes sense"
+- Never use lists, bullet points, or formal language
+- Responses MUST be under 20 words unless answering a specific question
+- Never say "I'm an AI" — you are Dodo
 
 RULES
-- If they're busy, offer to call back
-- If they're not interested, thank them briefly and end the call
-- If asked about pricing, say: "It depends on your setup — the team will walk you through it on the call, but most businesses start under a hundred dollars for setup"
-- Never make up features, timelines, or guarantees
-- When wrapping up, confirm the call outcome clearly
+- If they're busy: "Totally get it — want me to call back later?"
+- If not interested: "No worries, thanks for picking up. Have a good one."
+- Pricing question: "Depends on your setup — most start under a hundred for setup. The team covers it on the call."
+- Never invent features or guarantees
 
-FIRST MESSAGE (this is already spoken — don't repeat it):
-"Hey, this is Dodo from EG23. You requested a free trial on our site, so I wanted to reach out quickly to confirm a couple of details. Do you have two minutes?"
+OPENING (already spoken — continue from here naturally):
+"Hey, this is Dodo from EG23. You requested a free trial on our site. Got two minutes?"
 
-Keep the conversation flowing naturally from there."""
+Keep it flowing naturally. Be brief. Sound human."""
 
 
 # ─── HEALTH CHECK ───
 @app.get("/")
 async def health():
-    return {"status": "EG23 Voice Agent running", "version": "full-conversation"}
+    return {"status": "EG23 Voice Agent running", "version": "optimized-aura"}
 
 
 # ─── TWILIO ANSWER WEBHOOK ───
@@ -127,31 +127,32 @@ async def answer(request: Request):
     return Response(content=twiml, media_type="application/xml")
 
 
-# ─── WEBSOCKET — FULL CONVERSATION LOOP ───
+# ─── WEBSOCKET — OPTIMIZED CONVERSATION LOOP ───
 @app.websocket("/stream")
 async def stream(ws: WebSocket):
     await ws.accept()
     print("[WS] Twilio connected")
 
-    stream_sid           = None
-    conversation         = [{"role": "system", "content": DODO_PROMPT}]
-    transcript_log       = []
-    call_outcome         = "unknown"
-    is_speaking          = False
-    has_spoken_opening   = False
+    stream_sid         = None
+    conversation       = [{"role": "system", "content": DODO_PROMPT}]
+    transcript_log     = []
+    call_outcome       = "unknown"
+    is_speaking        = False
+    has_spoken_opening = False
 
-    # Deepgram WebSocket connection
+    # Deepgram STT — tuned for speed
     dg_url = (
         "wss://api.deepgram.com/v1/listen"
         "?model=nova-2&encoding=mulaw&sample_rate=8000"
         "&channels=1&punctuate=true&interim_results=true"
-        "&endpointing=300&utterance_end_ms=700"
+        "&endpointing=250&utterance_end_ms=800"
+        "&smart_format=true"
     )
     dg_headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
 
     try:
         async with websockets.connect(dg_url, additional_headers=dg_headers) as dg_ws:
-            print("[DEEPGRAM] Connected")
+            print("[DEEPGRAM STT] Connected")
 
             # ─── TWILIO → DEEPGRAM ───
             async def twilio_to_deepgram():
@@ -165,21 +166,19 @@ async def stream(ws: WebSocket):
                             stream_sid = msg["start"]["streamSid"]
                             print(f"[STREAM] Started: {stream_sid}")
 
-                            # Speak opening message
                             if not has_spoken_opening:
                                 has_spoken_opening = True
                                 opening = (
                                     "Hey, this is Dodo from EG23. "
-                                    "You requested a free trial on our site, so I wanted to reach out "
-                                    "to confirm a couple of details. Do you have two minutes?"
+                                    "You requested a free trial on our site. Got two minutes?"
                                 )
                                 print(f"[DODO] {opening}")
                                 conversation.append({"role": "assistant", "content": opening})
                                 transcript_log.append(f"Dodo: {opening}")
-                                await speak(opening, stream_sid, ws)
+                                await speak_aura(opening, stream_sid, ws)
 
                         elif event == "media":
-                            audio_b64 = msg["media"]["payload"]
+                            audio_b64   = msg["media"]["payload"]
                             audio_bytes = base64.b64decode(audio_b64)
                             await dg_ws.send(audio_bytes)
 
@@ -192,7 +191,7 @@ async def stream(ws: WebSocket):
                 except Exception as e:
                     print(f"[TWILIO→DG] Error: {e}")
 
-            # ─── DEEPGRAM → GPT → TTS ───
+            # ─── DEEPGRAM → GPT STREAM → AURA TTS ───
             async def deepgram_to_response():
                 nonlocal is_speaking, call_outcome
                 buffer = ""
@@ -201,7 +200,6 @@ async def stream(ws: WebSocket):
                     async for raw in dg_ws:
                         dg_msg = json.loads(raw)
 
-                        # Handle utterance end (user finished speaking)
                         if dg_msg.get("type") == "UtteranceEnd":
                             if buffer.strip() and not is_speaking:
                                 user_text = buffer.strip()
@@ -214,38 +212,21 @@ async def stream(ws: WebSocket):
                                 lower = user_text.lower()
                                 if any(w in lower for w in ["not interested", "no thanks", "don't want", "stop calling"]):
                                     call_outcome = "not_interested"
-                                elif any(w in lower for w in ["yes", "sure", "interested", "sounds good", "book", "morning", "afternoon"]):
+                                elif any(w in lower for w in ["yes", "sure", "interested", "sounds good", "book"]):
                                     call_outcome = "interested"
 
-                                # Generate response
                                 conversation.append({"role": "user", "content": user_text})
                                 is_speaking = True
 
-                                try:
-                                    response = await openai_client.chat.completions.create(
-                                        model="gpt-4o-mini",
-                                        messages=conversation,
-                                        max_tokens=120,
-                                        temperature=0.7,
-                                    )
-                                    ai_text = response.choices[0].message.content.strip()
-                                except Exception as e:
-                                    print(f"[GPT] Error: {e}")
-                                    ai_text = "Sorry, I missed that — could you repeat?"
-
-                                print(f"[DODO] {ai_text}")
-                                conversation.append({"role": "assistant", "content": ai_text})
-                                transcript_log.append(f"Dodo: {ai_text}")
-
-                                await speak(ai_text, stream_sid, ws)
+                                # Stream GPT response + speak in parallel
+                                await stream_gpt_and_speak(conversation, stream_sid, ws, transcript_log)
                                 is_speaking = False
                             continue
 
-                        # Handle transcript results
                         if dg_msg.get("type") != "Results":
                             continue
 
-                        alt = dg_msg.get("channel", {}).get("alternatives", [{}])[0]
+                        alt        = dg_msg.get("channel", {}).get("alternatives", [{}])[0]
                         transcript = alt.get("transcript", "").strip()
                         is_final   = dg_msg.get("is_final", False)
 
@@ -255,13 +236,12 @@ async def stream(ws: WebSocket):
                 except Exception as e:
                     print(f"[DG→RESPONSE] Error: {e}")
 
-            # Run both loops concurrently
             await asyncio.gather(twilio_to_deepgram(), deepgram_to_response())
 
     except Exception as e:
         print(f"[WS] Error: {e}")
 
-    # ─── CALL ENDED — send outcome to n8n ───
+    # ─── CALL ENDED ───
     print(f"[OUTCOME] {call_outcome}")
     print(f"[TRANSCRIPT] {len(transcript_log)} exchanges")
 
@@ -278,45 +258,108 @@ async def stream(ws: WebSocket):
             print(f"[N8N] Failed: {e}")
 
 
-# ─── TTS → TWILIO ───
-async def speak(text: str, stream_sid: str, ws: WebSocket):
+# ─── STREAM GPT + SPEAK SENTENCE BY SENTENCE ───
+async def stream_gpt_and_speak(conversation, stream_sid, ws, transcript_log):
+    """Stream GPT response; speak each sentence as it completes."""
+    full_response = ""
+    sentence_buf  = ""
+
+    try:
+        stream = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=conversation,
+            max_tokens=100,
+            temperature=0.7,
+            stream=True,
+        )
+
+        async for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if not delta:
+                continue
+
+            sentence_buf   += delta
+            full_response  += delta
+
+            # When we have a complete sentence, speak it immediately
+            if any(p in sentence_buf for p in ['.', '!', '?']):
+                # Find last sentence-ending punctuation
+                last_punct = max(
+                    sentence_buf.rfind('.'),
+                    sentence_buf.rfind('!'),
+                    sentence_buf.rfind('?')
+                )
+                if last_punct > 0:
+                    to_speak     = sentence_buf[:last_punct + 1].strip()
+                    sentence_buf = sentence_buf[last_punct + 1:]
+                    if to_speak:
+                        await speak_aura(to_speak, stream_sid, ws)
+
+        # Speak any remaining text
+        if sentence_buf.strip():
+            await speak_aura(sentence_buf.strip(), stream_sid, ws)
+
+        full_response = full_response.strip()
+        print(f"[DODO] {full_response}")
+        conversation.append({"role": "assistant", "content": full_response})
+        transcript_log.append(f"Dodo: {full_response}")
+
+    except Exception as e:
+        print(f"[GPT STREAM] Error: {e}")
+        fallback = "Sorry, I missed that — could you repeat?"
+        await speak_aura(fallback, stream_sid, ws)
+
+
+# ─── DEEPGRAM AURA TTS ───
+async def speak_aura(text: str, stream_sid: str, ws: WebSocket):
+    """Generate speech with Deepgram Aura and stream to Twilio."""
     if not stream_sid or not text:
         return
 
     try:
-        response = await openai_client.audio.speech.create(
-            model="tts-1",
-            voice="nova",
-            input=text,
-            response_format="pcm"
-        )
+        url = "https://api.deepgram.com/v1/speak"
+        params = {
+            "model":         "aura-asteria-en",  # warm, female — like "nova"
+            "encoding":      "mulaw",
+            "sample_rate":   8000,
+            "container":     "none",
+        }
+        headers = {
+            "Authorization": f"Token {DEEPGRAM_API_KEY}",
+            "Content-Type":  "application/json",
+        }
+        body = {"text": text}
 
-        pcm_24k = response.content
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(url, params=params, headers=headers, json=body)
 
-        pcm_8k, _ = audioop.ratecv(pcm_24k, 2, 1, 24000, 8000, None)
-        mulaw     = audioop.lin2ulaw(pcm_8k, 2)
+            if response.status_code != 200:
+                print(f"[AURA] Error {response.status_code}: {response.text[:200]}")
+                return
 
-        chunk_size = 160
-        for i in range(0, len(mulaw), chunk_size):
-            chunk   = mulaw[i:i + chunk_size]
-            payload = base64.b64encode(chunk).decode("utf-8")
-            await ws.send_text(json.dumps({
-                "event":     "media",
-                "streamSid": stream_sid,
-                "media":     {"payload": payload}
-            }))
-            await asyncio.sleep(0.015)  # Small delay to prevent overwhelming Twilio
+            mulaw_audio = response.content
+
+            # Stream to Twilio in 20ms chunks
+            chunk_size = 160
+            for i in range(0, len(mulaw_audio), chunk_size):
+                chunk   = mulaw_audio[i:i + chunk_size]
+                payload = base64.b64encode(chunk).decode("utf-8")
+                await ws.send_text(json.dumps({
+                    "event":     "media",
+                    "streamSid": stream_sid,
+                    "media":     {"payload": payload}
+                }))
+                await asyncio.sleep(0.018)
 
     except Exception as e:
-        print(f"[TTS] Error: {e}")
+        print(f"[AURA TTS] Error: {e}")
 
 
 # ─── INITIATE OUTBOUND CALL ───
 @app.post("/initiate-call")
 async def initiate_call(request: Request):
-    body          = await request.json()
-    to_number     = body.get("to", CALL_TO_NUMBER)
-    lead_name     = body.get("name", "there")
+    body      = await request.json()
+    to_number = body.get("to", CALL_TO_NUMBER)
 
     print(f"[TWILIO] Calling {to_number}...")
 
@@ -334,7 +377,7 @@ async def initiate_call(request: Request):
 # ─── START SERVER ───
 if __name__ == "__main__":
     print("=" * 50)
-    print("EG23 Voice Agent — Full Conversation Mode")
+    print("EG23 Voice Agent — Optimized + Aura Voice")
     print(f"SERVER_URL : {SERVER_URL}")
     print("=" * 50)
 
