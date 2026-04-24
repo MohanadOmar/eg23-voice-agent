@@ -3,3 +3,4 @@ openai
 fastapi
 uvicorn
 python-dotenv
+audioop-lts
