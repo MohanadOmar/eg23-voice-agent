@@ -159,8 +159,9 @@ async def stream(ws: WebSocket):
     dg_headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
 
     try:
-        async with websockets.connect(dg_url, additional_headers=dg_headers) as dg_ws:
-            print("[DEEPGRAM STT] Connected")
+        try:
+            async with websockets.connect(dg_url, additional_headers=dg_headers) as dg_ws:
+                print("[DEEPGRAM STT] Connected")
 
             async def twilio_to_deepgram():
                 nonlocal stream_sid, has_spoken_opening
